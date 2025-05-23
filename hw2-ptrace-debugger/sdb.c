@@ -264,8 +264,8 @@ void cmd_cont(void) {
                 perror("ptrace SINGLESTEP"); 
                 return;
             }
-            int st;
-            waitpid(child_pid, &st, 0);
+            int status;
+            waitpid(child_pid, &status, 0);
             enable_breakpoint(pending_bp);
             pending_bp = NULL; 
         }        
@@ -331,7 +331,7 @@ void cmd_break(const char *addr_str) {
     }
 
     int byte_idx = addr & 0x7;     
-    long word     = ptrace(PTRACE_PEEKTEXT, child_pid, addr - byte_idx, NULL);
+    long word = ptrace(PTRACE_PEEKTEXT, child_pid, addr - byte_idx, NULL);
     if (word == -1 && errno) {
         perror("ptrace PEEKTEXT");
         return;
@@ -347,9 +347,9 @@ void cmd_break(const char *addr_str) {
 
     bp_t *bp = &bp_tbl[bp_cnt++];
     bp->id = bp_cnt - 1;
-    bp->addr       = addr;
-    bp->orig_byte  = origin;
-    bp->active     = 1;
+    bp->addr = addr;
+    bp->orig_byte = origin;
+    bp->active = 1;
 
     printf("** set a breakpoint at 0x%lx.\n", addr);
 }
