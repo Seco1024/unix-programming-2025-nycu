@@ -1,15 +1,20 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <elf.h>
+#include <limits.h>  
+#include <signal.h>
+#include <ctype.h>    
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/user.h>
-#include <elf.h>
-#include <signal.h>
+#include <sys/sysmacros.h> 
 #include <capstone/capstone.h>
 
 #define MAX_LINE 256
@@ -19,8 +24,8 @@
 typedef struct {
     int id;
     unsigned long addr;
-    unsigned char    orig_byte;
-    int              active; 
+    unsigned char orig_byte;
+    int active; 
 } bp_t;
 
 static char input[MAX_LINE];
@@ -33,6 +38,8 @@ static int is_terminated = 0;
 static bp_t bp_tbl[MAX_BP];
 static int bp_cnt = 0;        
 static bp_t *pending_bp = NULL;
+static int in_syscall_phase = 0;
+static long last_sys_nr = 0; 
 
 enum cmd_id {
     CMD_LOAD,
@@ -43,6 +50,7 @@ enum cmd_id {
     CMD_BREAKRVA,
     CMD_DELETE,
     CMD_PATCH,
+    CMD_SYSCALL,
     CMD_UNKNOWN
 };
 
@@ -56,8 +64,9 @@ void cmd_break(const char *addr_str);
 void cmd_breakrva(const char *off_str);
 void cmd_delete(const char *id_str);
 void cmd_patch(const char *addr_str, const char *hex);
+void cmd_syscall(void);
 unsigned long get_entry_offset(const char *path);
-unsigned long get_base_address(pid_t pid);
+unsigned long get_base_address(pid_t pid, const char *exe_path);
 enum cmd_id lookup_cmd(char *cmd);
 void disassemble_at(pid_t pid, unsigned long addr, int count);
 static int addr_is_executable(unsigned long addr);
@@ -65,6 +74,21 @@ static int parse_u64(const char *s, unsigned long *out);
 static bp_t *find_bp_by_addr(unsigned long addr);
 static int hexpair_to_byte(char hi, char lo, unsigned char *out);
 static void enable_breakpoint(bp_t *bp);
+
+
+enum cmd_id lookup_cmd(char *cmd) {
+    if (!cmd) return CMD_UNKNOWN;
+    if (strcmp(cmd, "load") == 0) return CMD_LOAD;
+    if (strcmp(cmd, "si")   == 0) return CMD_SI;
+    if (strcmp(cmd, "cont") == 0) return CMD_CONT;
+    if (strcmp(cmd, "info") == 0) return CMD_INFO;
+    if (strcmp(cmd, "break") == 0) return CMD_BREAK;
+    if (strcmp(cmd, "breakrva") == 0) return CMD_BREAKRVA;
+    if (strcmp(cmd, "delete") == 0) return CMD_DELETE;
+    if (strcmp(cmd, "patch") == 0)   return CMD_PATCH; 
+    if (strcmp(cmd, "syscall") == 0) return CMD_SYSCALL;
+    return CMD_UNKNOWN;
+}
 
 void handle_command(void) {
     char raw[MAX_LINE];
@@ -115,22 +139,12 @@ void handle_command(void) {
             else puts("** the target address is not valid.");
             break;
         }
+        case CMD_SYSCALL:
+            cmd_syscall();
+            break;
         default:
             printf("** unknown command '%s'\n", raw);
     }
-}
-
-enum cmd_id lookup_cmd(char *cmd) {
-    if (!cmd) return CMD_UNKNOWN;
-    if (strcmp(cmd, "load") == 0) return CMD_LOAD;
-    if (strcmp(cmd, "si")   == 0) return CMD_SI;
-    if (strcmp(cmd, "cont") == 0) return CMD_CONT;
-    if (strcmp(cmd, "info") == 0) return CMD_INFO;
-    if (strcmp(cmd, "break") == 0) return CMD_BREAK;
-    if (strcmp(cmd, "breakrva") == 0) return CMD_BREAKRVA;
-    if (strcmp(cmd, "delete") == 0) return CMD_DELETE;
-    if (strcmp(cmd, "patch") == 0)   return CMD_PATCH; 
-    return CMD_UNKNOWN;
 }
 
 static int addr_is_executable(unsigned long addr) {
@@ -155,15 +169,13 @@ static int addr_is_executable(unsigned long addr) {
     return 0;
 }
 
-static int parse_u64(const char *s, unsigned long *out)
-{
+static int parse_u64(const char *s, unsigned long *out) {
     if (!s || !*s) return 0;
-    if (!strncmp(s, "0x", 2) || !strncmp(s, "0X", 2))
-        s += 2;
+    if (!strncmp(s, "0x", 2) || !strncmp(s, "0X", 2)) s += 2;
 
     char *end;
-    unsigned long val = strtoul(s, &end, 16);   /* 固定 base 16 */
-    if (*end) return 0;                         /* 出現非十六進位字元 */
+    unsigned long val = strtoul(s, &end, 16);      /* base 16 */
+    if (*end) return 0;                            /* non-hex */
 
     *out = val;
     return 1;
@@ -215,8 +227,26 @@ void cmd_load(char *path) {
     int status;
     waitpid(pid, &status, 0);
 
-    base_addr = get_base_address(pid);
+    base_addr = get_base_address(pid, path);
     entry_point = base_addr + entry_offset;
+
+    int idx = entry_point & 7;
+    long word = ptrace(PTRACE_PEEKTEXT, pid, entry_point - idx, NULL);
+    unsigned char orig = ((unsigned char *)&word)[idx];
+    ((unsigned char *)&word)[idx] = 0xCC;
+
+    ptrace(PTRACE_POKETEXT, pid, entry_point - idx, word);
+    ptrace(PTRACE_CONT, pid, NULL, NULL);            
+    int st; 
+    waitpid(pid, &st, 0);                
+
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+    regs.rip = entry_point;
+    ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+    ((unsigned char *)&word)[idx] = orig;
+    ptrace(PTRACE_POKETEXT, pid, entry_point - idx, word);
+
     printf("** program '%s' loaded. entry point: 0x%lx.\n", path, entry_point);
     disassemble_at(pid, entry_point, 5);
 }
@@ -319,6 +349,11 @@ void cmd_info_reg(void) {
 }
 
 void cmd_break(const char *addr_str) {
+    if (child_pid < 0) {
+        printf("** please load a program first.\n");
+        return;
+    }
+
     unsigned long addr;
     if (!parse_u64(addr_str, &addr)) {
         printf("** the target address is not valid.\n");
@@ -354,8 +389,7 @@ void cmd_break(const char *addr_str) {
     printf("** set a breakpoint at 0x%lx.\n", addr);
 }
 
-void cmd_breakrva(const char *off_str)
-{
+void cmd_breakrva(const char *off_str) {
     unsigned long off;
     if (!parse_u64(off_str, &off)) {
         puts("** the target address is not valid.");
@@ -395,6 +429,11 @@ void cmd_delete(const char *id_str) {
 }
 
 void cmd_patch(const char *addr_str, const char *hex) {
+    if (child_pid < 0) {
+        puts("** please load a program first.");
+        return;
+    }
+
     unsigned long addr;
     if (!parse_u64(addr_str, &addr)) {
         puts("** the target address is not valid."); 
@@ -408,21 +447,24 @@ void cmd_patch(const char *addr_str, const char *hex) {
     }
 
     unsigned char bytes[1024];
-    for (size_t i = 0; i < hlen; i += 2)
+    for (size_t i = 0; i < hlen; i += 2) {
         if (!hexpair_to_byte(hex[i], hex[i + 1], &bytes[i / 2])) {
             puts("** the target address is not valid."); 
             return;
         }
+    }
+
     size_t n = hlen / 2;
 
-    for (size_t o = 0; o < n; o++)
+    for (size_t o = 0; o < n; o++) {
         if (!addr_is_executable(addr + o)) {
-            puts("** the target address is not valid."); return;
+            puts("** the target address is not valid."); 
+            return;
         }
+    }
 
     for (int i = 0; i < bp_cnt; i++) {
-        if (!bp_tbl[i].active) 
-            continue;
+        if (!bp_tbl[i].active) continue;
         unsigned long bp_addr = bp_tbl[i].addr;
         if (bp_addr >= addr && bp_addr < addr + n)
             bp_tbl[i].orig_byte = bytes[bp_addr - addr];
@@ -430,7 +472,7 @@ void cmd_patch(const char *addr_str, const char *hex) {
 
     size_t off = 0;
     while (off < n) {
-        unsigned long cur  = addr + off;
+        unsigned long cur = addr + off;
         int idx = cur & 0x7;                   
         long word = ptrace(PTRACE_PEEKTEXT, child_pid, (void *)(cur - idx), NULL);
         if (word == -1 && errno) { 
@@ -439,8 +481,7 @@ void cmd_patch(const char *addr_str, const char *hex) {
         }
 
         size_t span = sizeof(long) - idx;                 
-        if (span > n - off) 
-            span = n - off;
+        if (span > n - off) span = n - off;
         memcpy(((unsigned char *)&word) + idx, bytes + off, span);
 
         if (ptrace(PTRACE_POKETEXT, child_pid, (void *)(cur - idx), (void *)word) < 0) {
@@ -449,6 +490,72 @@ void cmd_patch(const char *addr_str, const char *hex) {
         off += span;
     }
     printf("** patch memory at 0x%lx.\n", addr);
+} 
+
+void cmd_syscall(void) {
+    if (child_pid < 0) {
+        puts("** please load a program first.");
+        return;
+    }
+
+    if (pending_bp && pending_bp->active) {
+        if (ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL) < 0) {
+            perror("ptrace SINGLESTEP");
+            return;
+        }
+        int st;
+        waitpid(child_pid, &st, 0);
+        enable_breakpoint(pending_bp);
+        pending_bp = NULL;
+    }
+
+    if (ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL) < 0) {
+        perror("ptrace SYSCALL");
+        return;
+    }
+
+    int status;
+    waitpid(child_pid, &status, 0);
+
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+        puts("** the target program terminated.");
+        is_terminated = 1;
+        return;
+    }
+
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
+
+    unsigned long bp_addr = regs.rip - 1;        
+    bp_t *bp = find_bp_by_addr(bp_addr);
+
+    if (bp) {
+        restore_byte(bp);
+        regs.rip = bp_addr;
+        ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+
+        printf("** hit a breakpoint at 0x%lx.\n", bp_addr);
+        disassemble_at(child_pid, regs.rip, 5);
+        pending_bp = bp;
+        in_syscall_phase = 0;        
+        return;
+    }
+
+    unsigned long sc_addr = regs.rip - 2;   
+
+    if (!in_syscall_phase) {                   
+        last_sys_nr = regs.orig_rax;  
+        in_syscall_phase = 1;         
+
+        printf("** enter a syscall(%ld) at 0x%lx.\n", last_sys_nr, sc_addr);
+        disassemble_at(child_pid, sc_addr, 5); 
+    } else {                            
+        long ret = regs.rax;            
+        in_syscall_phase = 0;                 
+
+        printf("** leave a syscall(%ld) = %ld at 0x%lx.\n", last_sys_nr, ret, sc_addr);
+        disassemble_at(child_pid, sc_addr, 5);
+    }
 }
 
 unsigned long get_entry_offset(const char *path) {
@@ -466,72 +573,126 @@ unsigned long get_entry_offset(const char *path) {
     return ehdr.e_entry;
 }
 
-unsigned long get_base_address(pid_t pid) {
-    char maps_path[64]; 
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
-    FILE *f = fopen(maps_path, "r"); if (!f) { 
-        perror("fopen maps"); 
+unsigned long get_base_address(pid_t pid, const char *exe_path) {
+    char real_exe[PATH_MAX];
+    if (!realpath(exe_path, real_exe)) {
+        perror("realpath"); return 0;
+    }
+    struct stat st;   // getting device no. and i-node
+    if (stat(real_exe, &st) < 0) { 
+        perror("stat"); 
         return 0; 
     }
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long start, end, offset, inode;
-        char perms[5], dev[6];
-        if (sscanf(line, "%lx-%lx %4s %lx %5s %lu", &start, &end, perms, &offset, dev, &inode) == 6) {
-            if (strchr(perms, 'x') && offset == 0) { 
-                fclose(f); 
-                return (ehdr.e_type == ET_DYN) ? start : 0; 
-            }
+
+    // first try: traverse /proc/PID/maps
+    char line[512];
+    char maps[64]; 
+    unsigned long cand_base = 0;
+
+    snprintf(maps, sizeof maps, "/proc/%d/maps", pid);
+    FILE *fp = fopen(maps, "r"); 
+    if (!fp) { 
+        perror("maps"); 
+        return 0; 
+    }
+
+    while (fgets(line, sizeof line, fp)) {
+        unsigned long start, end;
+        unsigned long off, inode;
+        char perms[5], dev[12], path[PATH_MAX] = "";
+        int n = sscanf(line, "%lx-%lx %4s %lx %11s %lu %s", &start, &end, perms, &off, dev, &inode, path);
+        if (n < 7 || !strchr(perms, 'x')) continue;
+
+        if (strcmp(path, real_exe) == 0) {
+            cand_base = start - off; 
+            break;
         }
     }
-    fclose(f);
-    return 0;
+    fclose(fp);
+
+    // second try: i-node + dev comparison (for patchelf) 
+    if (cand_base == 0) {
+        fp = fopen(maps, "r");
+        while (fgets(line, sizeof line, fp)) {
+            unsigned long start, end;
+            unsigned long off, inode;
+            char perms[5], dev[12];
+            if (sscanf(line, "%lx-%lx %4s %lx %11s %lu", &start, &end, perms, &off, dev, &inode) != 6) continue;
+            if (!strchr(perms, 'x')) continue;
+
+            unsigned maj, min;
+            if (sscanf(dev, "%x:%x", &maj, &min) != 2) continue;
+            if (inode == st.st_ino && maj == major(st.st_dev) && min == minor(st.st_dev)) {
+                cand_base = start - off;
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    if (ehdr.e_type != ET_DYN) cand_base = 0;
+    return cand_base;
 }
 
 void disassemble_at(pid_t pid, unsigned long addr, int count) {
     csh handle;
-    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) 
-        return;
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) return;
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_OFF);
 
-    unsigned char buf[16];
-    size_t offset = 0;
+    unsigned long cur = addr;  
+    int done = 0;  
 
-    for (int i = 0; i < count; i++) {
-        long data = ptrace(PTRACE_PEEKTEXT, pid, addr + offset, NULL);
-        if (data == -1 && errno) { 
-            perror("ptrace PEEKTEXT"); 
-            break; 
+    while (done < count) {
+        if (!addr_is_executable(cur)) {
+            puts("** the address is out of the range of the executable region.");
+            break;
         }
 
-        memcpy(buf, &data, sizeof(data));
+        unsigned char buf[16] = {0};
+        int fetched = 0;
 
-        // Replace int3 breakpoint with origin text
-        unsigned long word_start = addr + offset;
-        for (int j = 0; j < bp_cnt; j++) {
-            if (!bp_tbl[j].active) continue;
-            unsigned long bp_addr = bp_tbl[j].addr;
-            if (bp_addr >= word_start && bp_addr < word_start + sizeof(long)) {
-                size_t idx = bp_addr - word_start;     
-                buf[idx] = bp_tbl[j].orig_byte;       
-            }
+        for (; fetched < 16; ++fetched) {
+            unsigned long baddr = cur + fetched;
+            if (!addr_is_executable(baddr)) break;                
+            errno = 0;
+            long word = ptrace(PTRACE_PEEKTEXT, pid, (void *)(baddr & ~7UL), NULL);
+            if (word == -1 && errno) break;         
+            buf[fetched] = ((unsigned char *)&word)[baddr & 7];
+        }
+
+        if (fetched == 0) {
+            puts("** the address is out of the range of the executable region.");
+            break;
+        }
+
+        for (int k = 0; k < bp_cnt; ++k) {
+            if (bp_tbl[k].active && 
+                bp_tbl[k].addr >= cur && 
+                bp_tbl[k].addr < cur + fetched)
+                buf[bp_tbl[k].addr - cur] = bp_tbl[k].orig_byte;
         }
 
         cs_insn *insn;
-        size_t insn_count = cs_disasm(handle, buf, sizeof(buf), addr + offset, 1, &insn);
-        if (!insn_count) break;
+        size_t n = cs_disasm(handle, buf, fetched, cur, 1, &insn);
+        if (n == 0) {
+            puts("** the address is out of the range of the executable region.");
+            break;
+        }
 
         printf("    %lx:\t", insn[0].address);
-        int byte_len = 0;
-        for (int b = 0; b < insn[0].size; b++) {
-            printf("%02x ", insn[0].bytes[b]); byte_len += 3;
-        }
-        int pad = BYTE_COL_WIDTH - byte_len; if (pad < 1) pad = 1;
-        while (pad--) putchar(' ');
-        printf("%-8s %s\n", insn[0].mnemonic, insn[0].op_str);
 
-        offset += insn[0].size;
-        cs_free(insn, insn_count);
+        int hexlen = 0;
+        for (size_t b = 0; b < insn[0].size; ++b) {
+            printf("%02x ", insn[0].bytes[b]);
+            hexlen += 3;
+        }
+        for (int pad = BYTE_COL_WIDTH - hexlen; pad > 0; --pad)
+            putchar(' ');
+
+        printf("%-8s %s\n", insn[0].mnemonic, insn[0].op_str);
+        cur  += insn[0].size;
+        done += 1;
+        cs_free(insn, n);
     }
     cs_close(&handle);
 }
