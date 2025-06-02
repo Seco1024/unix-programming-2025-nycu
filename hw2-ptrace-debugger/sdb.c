@@ -250,37 +250,78 @@ void cmd_load(char *path) {
     printf("** program '%s' loaded. entry point: 0x%lx.\n", path, entry_point);
     disassemble_at(pid, entry_point, 5);
 }
-
 void cmd_si(void) {
     if (child_pid < 0) {
         printf("** please load a program first.\n");
         return;
     }
-    if (ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL) < 0) { 
-        perror("ptrace SINGLESTEP"); 
-        return; 
+
+    bp_t *bp_stepped_from = pending_bp; 
+
+    if (ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL) < 0) {
+        perror("ptrace SINGLESTEP");
+        return;
     }
     int status;
     waitpid(child_pid, &status, 0);
+
     if (WIFEXITED(status) || WIFSIGNALED(status)) {
         printf("** the target program terminated.\n");
         is_terminated = 1;
-    } 
+        return; 
+    }
+
     if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
         struct user_regs_struct regs;
         ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
-        unsigned long bp_addr = regs.rip;
-        bp_t *bp = find_bp_by_addr(regs.rip);
-        if (bp) {
-            restore_byte(bp);
-            regs.rip = bp_addr;
-            ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
-            printf("** hit a breakpoint at 0x%lx.\n", bp_addr);
-            pending_bp = bp;  
+        unsigned long current_rip = regs.rip; 
+
+        if (bp_stepped_from && bp_stepped_from->active) {
+            enable_breakpoint(bp_stepped_from);
         }
-        disassemble_at(child_pid, regs.rip, 5);
+
+        bp_t *bp_landed_on = find_bp_by_addr(current_rip);
+
+        if (bp_landed_on) {
+            restore_byte(bp_landed_on);
+            printf("** hit a breakpoint at 0x%lx.\n", current_rip);
+            pending_bp = bp_landed_on; 
+        } else {
+            pending_bp = NULL;
+        }
+        disassemble_at(child_pid, current_rip, 5);
     }
 }
+// void cmd_si(void) {
+//     if (child_pid < 0) {
+//         printf("** please load a program first.\n");
+//         return;
+//     }
+//     if (ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL) < 0) { 
+//         perror("ptrace SINGLESTEP"); 
+//         return; 
+//     }
+//     int status;
+//     waitpid(child_pid, &status, 0);
+//     if (WIFEXITED(status) || WIFSIGNALED(status)) {
+//         printf("** the target program terminated.\n");
+//         is_terminated = 1;
+//     } 
+//     if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+//         struct user_regs_struct regs;
+//         ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
+//         unsigned long bp_addr = regs.rip;
+//         bp_t *bp = find_bp_by_addr(regs.rip);
+//         if (bp) {
+//             restore_byte(bp);
+//             regs.rip = bp_addr;
+//             ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+//             printf("** hit a breakpoint at 0x%lx.\n", bp_addr);
+//             pending_bp = bp;  
+//         }
+//         disassemble_at(child_pid, regs.rip, 5);
+//     }
+// }
 
 void cmd_cont(void) {
     if (child_pid < 0) {
@@ -442,23 +483,27 @@ void cmd_patch(const char *addr_str, const char *hex) {
 
     size_t hlen = strlen(hex);
     if (!hlen || hlen > 2048 || (hlen & 1)) {
-        puts("** the target address is not valid."); 
+        printf("** patch_size is not valid.\n"); 
         return;
     }
 
-    unsigned char bytes[1024];
+    unsigned char bytes[1024]; 
+    size_t n = hlen / 2;
+    if (n == 0) { 
+        printf("** patch_size is not valid.\n");
+        return;
+    }
+
     for (size_t i = 0; i < hlen; i += 2) {
         if (!hexpair_to_byte(hex[i], hex[i + 1], &bytes[i / 2])) {
-            puts("** the target address is not valid."); 
+             printf("** patch_hex_format is not valid.\n"); // Or keep original
             return;
         }
     }
 
-    size_t n = hlen / 2;
-
     for (size_t o = 0; o < n; o++) {
         if (!addr_is_executable(addr + o)) {
-            puts("** the target address is not valid."); 
+            printf("** the patched address is not in an executable region.\n"); // Or keep original
             return;
         }
     }
@@ -466,17 +511,18 @@ void cmd_patch(const char *addr_str, const char *hex) {
     for (int i = 0; i < bp_cnt; i++) {
         if (!bp_tbl[i].active) continue;
         unsigned long bp_addr = bp_tbl[i].addr;
-        if (bp_addr >= addr && bp_addr < addr + n)
+        if (bp_addr >= addr && bp_addr < (addr + n)) { 
             bp_tbl[i].orig_byte = bytes[bp_addr - addr];
+        }
     }
 
     size_t off = 0;
     while (off < n) {
-        unsigned long cur = addr + off;
-        int idx = cur & 0x7;                   
-        long word = ptrace(PTRACE_PEEKTEXT, child_pid, (void *)(cur - idx), NULL);
+        unsigned long cur_write_addr = addr + off;
+        int idx = cur_write_addr & 0x7;                   
+        long word = ptrace(PTRACE_PEEKTEXT, child_pid, (void *)(cur_write_addr - idx), NULL);
         if (word == -1 && errno) { 
-            perror("PTRACE_PEEKTEXT"); 
+            perror("PTRACE_PEEKTEXT for patch"); 
             return; 
         }
 
@@ -484,13 +530,29 @@ void cmd_patch(const char *addr_str, const char *hex) {
         if (span > n - off) span = n - off;
         memcpy(((unsigned char *)&word) + idx, bytes + off, span);
 
-        if (ptrace(PTRACE_POKETEXT, child_pid, (void *)(cur - idx), (void *)word) < 0) {
-            perror("PTRACE_POKETEXT"); return;
+        if (ptrace(PTRACE_POKETEXT, child_pid, (void *)(cur_write_addr - idx), (void *)word) < 0) {
+            perror("PTRACE_POKETEXT for patch"); 
+            return;
         }
         off += span;
     }
+
+
+    for (int i = 0; i < bp_cnt; i++) {
+        if (!bp_tbl[i].active) {
+            continue;
+        }
+
+        if (bp_tbl[i].addr >= addr && bp_tbl[i].addr < (addr + n)) {
+            if (&bp_tbl[i] == pending_bp) {
+            } else {
+                enable_breakpoint(&bp_tbl[i]);
+            }
+        }
+    }
+
     printf("** patch memory at 0x%lx.\n", addr);
-} 
+}
 
 void cmd_syscall(void) {
     if (child_pid < 0) {
@@ -610,25 +672,25 @@ unsigned long get_base_address(pid_t pid, const char *exe_path) {
     }
     fclose(fp);
 
-    // second try: i-node + dev comparison (for patchelf) 
-    if (cand_base == 0) {
-        fp = fopen(maps, "r");
-        while (fgets(line, sizeof line, fp)) {
-            unsigned long start, end;
-            unsigned long off, inode;
-            char perms[5], dev[12];
-            if (sscanf(line, "%lx-%lx %4s %lx %11s %lu", &start, &end, perms, &off, dev, &inode) != 6) continue;
-            if (!strchr(perms, 'x')) continue;
+    // // second try: i-node + dev comparison (for patchelf) 
+    // if (cand_base == 0) {
+    //     fp = fopen(maps, "r");
+    //     while (fgets(line, sizeof line, fp)) {
+    //         unsigned long start, end;
+    //         unsigned long off, inode;
+    //         char perms[5], dev[12];
+    //         if (sscanf(line, "%lx-%lx %4s %lx %11s %lu", &start, &end, perms, &off, dev, &inode) != 6) continue;
+    //         if (!strchr(perms, 'x')) continue;
 
-            unsigned maj, min;
-            if (sscanf(dev, "%x:%x", &maj, &min) != 2) continue;
-            if (inode == st.st_ino && maj == major(st.st_dev) && min == minor(st.st_dev)) {
-                cand_base = start - off;
-                break;
-            }
-        }
-        fclose(fp);
-    }
+    //         unsigned maj, min;
+    //         if (sscanf(dev, "%x:%x", &maj, &min) != 2) continue;
+    //         if (inode == st.st_ino && maj == major(st.st_dev) && min == minor(st.st_dev)) {
+    //             cand_base = start - off;
+    //             break;
+    //         }
+    //     }
+    //     fclose(fp);
+    // }
 
     if (ehdr.e_type != ET_DYN) cand_base = 0;
     return cand_base;
